@@ -1,0 +1,255 @@
+AWSTemplateFormatVersion: 2010-09-09
+Transform: AWS::Serverless-2016-10-31
+Description: Soteria component stack
+
+##########################################
+
+Conditions:
+  IsProduction: !Equals [!Select [2, !Split ["-", !Ref AWS::StackName]], prd]
+  IsSandbox: !Equals [!Select [2, !Split ["-", !Ref AWS::StackName]], sbx]
+
+##########################################
+
+Resources:
+  # CloudFrontDistributionLogs:
+  #   Type: "AWS::S3::Bucket"
+  #   Properties:
+  #     AccessControl: Private
+  #     BucketName: !Sub "${AWS::StackName}-logs"
+
+  # Origin:
+  #   Type: "AWS::S3::Bucket"
+  #   Properties:
+  #     BucketName: !Sub "${AWS::StackName}-origin"
+  #     VersioningConfiguration:
+  #       Status: Enabled
+
+  WebACL:
+    Type: "AWS::WAFv2::WebACL"
+    Condition: IsProduction
+    Properties:
+      DefaultAction:
+        Allow: {}
+        # Block: {}
+      Description: Primary WebACL for CloudFront
+      Name: !Sub "${AWS::StackName}-wafv2-webacl"
+      Scope: CLOUDFRONT # must be region us-east-1
+      Rules:
+        - Name: AWSManagedRulesCommonRuleSet
+          OverrideAction:
+            Count: {}
+          Priority: 0
+          Statement:
+            ManagedRuleGroupStatement:
+              VendorName: AWS
+              Name: AWSManagedRulesCommonRuleSet
+              ExcludedRules: []
+          VisibilityConfig:
+            CloudWatchMetricsEnabled: true
+            MetricName: CloudFrontAWSManagedRulesCommonRuleSet
+            SampledRequestsEnabled: false
+      VisibilityConfig:
+        CloudWatchMetricsEnabled: true
+        MetricName: CloudFrontWebACL
+        SampledRequestsEnabled: false
+
+  OriginBucketPolicy:
+    Type: "AWS::S3::BucketPolicy"
+    Properties:
+      #Bucket: !Ref Origin
+      Bucket: !Sub "${AWS::StackName}-origin"
+      PolicyDocument:
+        Statement:
+          - Action:
+              - s3:GetObject
+            Effect: Allow
+            Resource:
+              Fn::Join:
+                - ""
+                - - "arn:aws:s3:::"
+                  - !Ref AWS::StackName
+                  - "-origin/*"
+            Principal:
+              CanonicalUser: !GetAtt OriginAccessIdentity.S3CanonicalUserId
+
+  OriginAccessIdentity:
+    Type: AWS::CloudFront::CloudFrontOriginAccessIdentity
+    Properties:
+      CloudFrontOriginAccessIdentityConfig:
+        Comment: !Sub "${AWS::StackName}-origin.s3.amazonaws.com"
+
+  CloudFrontDistribution:
+    Type: AWS::CloudFront::Distribution
+    Properties:
+      DistributionConfig:
+        Comment: !Sub "CloudFront Distribution for ${AWS::StackName}"
+        WebACLId: !If [IsProduction, !GetAtt WebACL.Arn, !Ref AWS::NoValue]
+        Origins:
+          - DomainName: !Sub "${AWS::StackName}-origin.s3.amazonaws.com"
+            Id: !Sub ${AWS::StackName}-origin
+            S3OriginConfig:
+              OriginAccessIdentity:
+                !Join [
+                  "",
+                  [
+                    "origin-access-identity/cloudfront/",
+                    !Ref OriginAccessIdentity,
+                  ],
+                ]
+        Enabled: true
+        IPV6Enabled: true
+        DefaultRootObject: index.html
+        Logging:
+          IncludeCookies: false
+          #Bucket: !Sub "${CloudFrontDistributionLogs}.s3.amazonaws.com"
+          Bucket: !Sub "${AWS::StackName}-logs.s3.amazonaws.com"
+        #  Prefix:
+        Aliases:
+          - Fn::ImportValue: !Join
+              - "-"
+              - - !Select [0, !Split ["-", !Ref AWS::StackName]]
+                - !Select [1, !Split ["-", !Ref AWS::StackName]]
+                - !Select [2, !Split ["-", !Ref AWS::StackName]]
+                - "domains-UserDomainName"
+          # - Fn::ImportValue: !Join
+          #     - "-"
+          #     - - !Select [0, !Split ["-", !Ref AWS::StackName]]
+          #       - !Select [1, !Split ["-", !Ref AWS::StackName]]
+          #       - !Select [2, !Split ["-", !Ref AWS::StackName]]
+          #       - "domains-PublicDomainName"
+        DefaultCacheBehavior:
+          DefaultTTL: !If [IsSandbox, "0", !Ref AWS::NoValue]
+          AllowedMethods:
+            - DELETE
+            - GET
+            - HEAD
+            - OPTIONS
+            - PATCH
+            - POST
+            - PUT
+          TargetOriginId: !Sub ${AWS::StackName}-origin
+          ForwardedValues:
+            QueryString: false
+            Cookies:
+              Forward: none
+          ViewerProtocolPolicy: redirect-to-https
+          LambdaFunctionAssociations:
+            - EventType: origin-request
+              LambdaFunctionARN: !Ref LambdaOriginRequest.Version
+            - EventType: origin-response
+              LambdaFunctionARN: !Ref LambdaOriginResponse.Version
+        ViewerCertificate:
+          SslSupportMethod: sni-only
+          AcmCertificateArn:
+            Fn::ImportValue: !Join
+              - "-"
+              - - !Select [0, !Split ["-", !Ref AWS::StackName]]
+                - !Select [1, !Split ["-", !Ref AWS::StackName]]
+                - !Select [2, !Split ["-", !Ref AWS::StackName]]
+                - "certificates-UserCertificateArn"
+        #PriceClass: PriceClass_200
+        # CustomErrorResponses:
+        #   - ErrorCode: 404
+        #     ResponseCode: 200
+        #     ResponsePagePath: /index.html
+        #     ErrorCachingMinTTL: 0
+        #   - ErrorCode: 403
+        #     ResponseCode: 200
+        #     ResponsePagePath: /index.html
+        #     ErrorCachingMinTTL: 0
+
+  UserRecordSetGroup:
+    Type: AWS::Route53::RecordSetGroup
+    Properties:
+      HostedZoneId:
+        Fn::ImportValue: !Join
+          - "-"
+          - - !Select [0, !Split ["-", !Ref AWS::StackName]]
+            - !Select [1, !Split ["-", !Ref AWS::StackName]]
+            - !Select [2, !Split ["-", !Ref AWS::StackName]]
+            - "domains-UserHostedZoneId"
+      RecordSets:
+        - Name:
+            Fn::ImportValue: !Join
+              - "-"
+              - - !Select [0, !Split ["-", !Ref AWS::StackName]]
+                - !Select [1, !Split ["-", !Ref AWS::StackName]]
+                - !Select [2, !Split ["-", !Ref AWS::StackName]]
+                - "domains-UserDomainName"
+          Type: A
+          AliasTarget:
+            HostedZoneId: "Z2FDTNDATAQYW2" # magic number
+            DNSName: !GetAtt "CloudFrontDistribution.DomainName"
+
+  PublicRecordSetGroup:
+    Type: AWS::Route53::RecordSetGroup
+    Properties:
+      HostedZoneId:
+        Fn::ImportValue: !Join
+          - "-"
+          - - !Select [0, !Split ["-", !Ref AWS::StackName]]
+            - !Select [1, !Split ["-", !Ref AWS::StackName]]
+            - !Select [2, !Split ["-", !Ref AWS::StackName]]
+            - "domains-PublicHostedZoneId"
+      RecordSets:
+        - Name:
+            Fn::ImportValue: !Join
+              - "-"
+              - - !Select [0, !Split ["-", !Ref AWS::StackName]]
+                - !Select [1, !Split ["-", !Ref AWS::StackName]]
+                - !Select [2, !Split ["-", !Ref AWS::StackName]]
+                - "domains-PublicDomainName"
+          Type: A
+          AliasTarget:
+            HostedZoneId: "Z2FDTNDATAQYW2" # magic number
+            DNSName: !GetAtt "CloudFrontDistribution.DomainName"
+
+  LambdaOriginRequest:
+    Type: AWS::Serverless::Function
+    Properties:
+      # replicas take hours to delete, preventing recreation with pre-defined name
+      # https://docs.aws.amazon.com/AmazonCloudFront/latest/DeveloperGuide/lambda-edge-delete-replicas.html
+      # FunctionName: !Sub "${AWS::StackName}-lambda-directory-index"
+      Runtime: nodejs12.x
+      Handler: index.handler
+      CodeUri: ../packages/directory-index.zip
+      Role: !GetAtt LambdaEdgeFunctionRole.Arn
+      AutoPublishAlias: live
+
+  LambdaOriginResponse:
+    Type: AWS::Serverless::Function
+    Properties:
+      # replicas take hours to delete, preventing recreation with pre-defined name
+      # https://docs.aws.amazon.com/AmazonCloudFront/latest/DeveloperGuide/lambda-edge-delete-replicas.html
+      # FunctionName: !Sub "${AWS::StackName}-lambda-directory-index"
+      Runtime: nodejs12.x
+      Handler: index.handler
+      CodeUri: ../packages/use-index-for-client-side-route.zip
+      Role: !GetAtt LambdaEdgeFunctionRole.Arn
+      AutoPublishAlias: live
+
+  LambdaEdgeFunctionRole:
+    Type: "AWS::IAM::Role"
+    Properties:
+      Path: "/"
+      ManagedPolicyArns:
+        - "arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole"
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Sid: "AllowLambdaServiceToAssumeRole"
+            Effect: "Allow"
+            Action:
+              - "sts:AssumeRole"
+            Principal:
+              Service:
+                - "lambda.amazonaws.com"
+                - "edgelambda.amazonaws.com"
+
+Outputs:
+
+  CloudFrontDistribution:
+    Description: "CloudFront Distribution ID"
+    Value: !Ref CloudFrontDistribution
+    Export:
+      Name: !Sub "${AWS::StackName}-Id"
